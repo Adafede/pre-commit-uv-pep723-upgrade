@@ -1,0 +1,10 @@
+[project]
+name = "pre-commit-uv-pep723-upgrade"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = [
+    "packaging",
+]
+
+[project.scripts]
+uv-pep723-upgrade = "uv_pep723_upgrade:main"
