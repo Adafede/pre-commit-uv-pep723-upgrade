@@ -1,6 +1,6 @@
 - id: uv-pep723-upgrade
   name: Upgrade PEP 723 script dependencies
-  entry: uv_pep723_upgrade.py
-  language: python
+  entry: uv run uv_pep723_upgrade.py
+  language: system
   pass_filenames: true
   types: [python]
