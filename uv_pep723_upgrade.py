@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """Upgrade dependencies in PEP 723 inline Python scripts.
 
-This pre-commit hook updates dependencies declared in PEP 723
-`# /// script` metadata blocks.
+This pre-commit hook updates all dependencies declared in PEP 723
+`# /// script` metadata blocks to the latest versions resolvable by uv.
 
-Default mode delegates everything to:
+It intentionally does NOT edit TOML itself. Instead it:
 
-    uv add --script --upgrade
+1. Finds the canonical PEP 723 script metadata block.
+2. Extracts package names from the dependency list.
+3. Delegates dependency resolution and TOML rewriting to:
+       uv add --script
 
-With --force-update, existing version operators are preserved while versions
-are refreshed:
+This keeps dependency resolution, formatting, and TOML mutation owned by uv.
 
-    fire==0.7.0  ->  fire==0.8.0
-    rich>=13.0   ->  rich>=14.0
-    jinja2~=3.1  ->  jinja2~=3.2
+Usage:
+
+    # Scan explicitly provided files
+    uv-pep723-upgrade script.py tools/foo.py
+
+    # Scan the whole repository
+    uv-pep723-upgrade --all
+
+Exit codes:
+
+    0  No changes
+    1  Files were modified (pre-commit will ask you to review/stage them)
+    2  Usage/configuration error
 
 Requires:
+
     - Python >= 3.11
     - uv
 """
@@ -47,7 +60,9 @@ _BLOCK_RE = re.compile(
 )
 
 
-def find_pep723_match(source: str) -> re.Match[str] | None:
+def find_pep723_block(source: str) -> str | None:
+    """Extract the TOML content from a PEP 723 script block."""
+
     blocks = [
         match
         for match in _BLOCK_RE.finditer(source)
@@ -60,163 +75,34 @@ def find_pep723_match(source: str) -> re.Match[str] | None:
     if len(blocks) > 1:
         raise ValueError("multiple PEP 723 script blocks found")
 
-    return blocks[0]
-
-
-def extract_block(match: re.Match[str]) -> str:
     return "".join(
         line[2:] if line.startswith("# ") else line[1:]
-        for line in match.group("content").splitlines(keepends=True)
+        for line in blocks[0].group("content").splitlines(keepends=True)
     )
-
-
-def dependency_requirements(raw_toml: str) -> list[Requirement]:
-    metadata = tomllib.loads(raw_toml)
-
-    result = []
-
-    for dependency in metadata.get("dependencies", []):
-        try:
-            result.append(Requirement(dependency))
-        except InvalidRequirement:
-            print(
-                f"! ignoring invalid dependency: {dependency}",
-                file=sys.stderr,
-            )
-
-    return result
 
 
 def dependency_names(raw_toml: str) -> list[str]:
-    return sorted(
-        {
-            req.name
-            for req in dependency_requirements(raw_toml)
-        }
-    )
+    """Return normalized package names from dependencies."""
 
+    metadata = tomllib.loads(raw_toml)
 
-def render_requirement_without_version(req: Requirement) -> str:
-    value = req.name
+    names: list[str] = []
 
-    if req.extras:
-        value += "[" + ",".join(sorted(req.extras)) + "]"
-
-    if req.marker:
-        value += f"; {req.marker}"
-
-    return value
-
-
-def replace_dependencies(
-    source: str,
-    match: re.Match[str],
-    dependencies: list[str],
-) -> str:
-    block = extract_block(match)
-
-    metadata = tomllib.loads(block)
-
-    old = metadata.get("dependencies", [])
-
-    if not old:
-        return source
-
-    replacements = iter(dependencies)
-
-    new_block = re.sub(
-        r'("dependencies"\s*=\s*\[\s*)(.*?)(\])',
-        lambda m: (
-            m.group(1)
-            + "\n"
-            + "".join(
-                f'    "{next(replacements)}",\n'
-                for _ in old
+    for dependency in metadata.get("dependencies", []):
+        try:
+            names.append(Requirement(dependency).name)
+        except InvalidRequirement:
+            print(
+                f"  ! ignoring invalid dependency: {dependency!r}",
+                file=sys.stderr,
             )
-            + m.group(3)
-        ),
-        block,
-        flags=re.S,
-    )
 
-    old_commented = match.group("content")
-
-    old_rendered = "".join(
-        line[2:] if line.startswith("# ") else line[1:]
-        for line in old_commented.splitlines(keepends=True)
-    )
-
-    commented = "".join(
-        "# " + line if line.strip() else "#\n"
-        for line in new_block.splitlines(keepends=True)
-    )
-
-    return (
-        source[: match.start("content")]
-        + commented
-        + source[match.end("content") :]
-    )
-
-
-def replace_dependency_versions(
-    source: str,
-    original: list[Requirement],
-) -> str:
-    match = find_pep723_match(source)
-
-    if match is None:
-        return source
-
-    resolved = dependency_requirements(
-        extract_block(match)
-    )
-
-    resolved_map = {
-        req.name: req
-        for req in resolved
-    }
-
-    rebuilt = []
-
-    for old in original:
-        new = resolved_map.get(old.name)
-
-        if new is None:
-            rebuilt.append(str(old))
-            continue
-
-        if not old.specifier:
-            rebuilt.append(str(new))
-            continue
-
-        latest_version = next(
-            iter(new.specifier)
-        ).version
-
-        operator = next(
-            iter(old.specifier)
-        ).operator
-
-        value = old.name
-
-        if old.extras:
-            value += "[" + ",".join(sorted(old.extras)) + "]"
-
-        value += f"{operator}{latest_version}"
-
-        if old.marker:
-            value += f"; {old.marker}"
-
-        rebuilt.append(value)
-
-    return replace_dependencies(
-        source,
-        match,
-        rebuilt,
-    )
+    return sorted(set(names))
 
 
 def python_files(root: Path) -> list[Path]:
+    """Find Python files suitable for PEP 723 scripts."""
+
     return [
         path
         for path in root.rglob("*.py")
@@ -226,7 +112,35 @@ def python_files(root: Path) -> list[Path]:
     ]
 
 
-def run_uv(path: Path) -> bool:
+def bump_file(path: Path) -> bool:
+    """Upgrade one file. Return True if modified."""
+
+    if not path.is_file():
+        return False
+
+    before = path.read_text(encoding="utf-8")
+
+    try:
+        block = find_pep723_block(before)
+    except ValueError as exc:
+        print(f"{path}: {exc}", file=sys.stderr)
+        return False
+
+    if block is None:
+        return False
+
+    packages = dependency_names(block)
+
+    if not packages:
+        return False
+
+    if shutil.which("uv") is None:
+        print(
+            "error: uv executable not found in PATH",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     result = subprocess.run(
         [
             "uv",
@@ -234,6 +148,7 @@ def run_uv(path: Path) -> bool:
             "--script",
             "--upgrade",
             str(path),
+            *packages,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -247,68 +162,7 @@ def run_uv(path: Path) -> bool:
         )
         return False
 
-    return True
-
-
-def bump_file(
-    path: Path,
-    force_update: bool,
-) -> bool:
-    if not path.is_file():
-        return False
-
-    before = path.read_text(encoding="utf-8")
-
-    try:
-        match = find_pep723_match(before)
-    except ValueError as exc:
-        print(f"{path}: {exc}", file=sys.stderr)
-        return False
-
-    if match is None:
-        return False
-
-    block = extract_block(match)
-
-    if force_update:
-        original = dependency_requirements(block)
-
-        temporary = replace_dependencies(
-            before,
-            match,
-            [
-                render_requirement_without_version(req)
-                for req in original
-            ],
-        )
-
-        path.write_text(
-            temporary,
-            encoding="utf-8",
-        )
-
-        if not run_uv(path):
-            path.write_text(before, encoding="utf-8")
-            return False
-
-        after = replace_dependency_versions(
-            path.read_text(encoding="utf-8"),
-            original,
-        )
-
-        path.write_text(
-            after,
-            encoding="utf-8",
-        )
-
-    else:
-        if not run_uv(path):
-            return False
-
-    changed = (
-        path.read_text(encoding="utf-8")
-        != before
-    )
+    changed = path.read_text(encoding="utf-8") != before
 
     if changed:
         print(f"✓ upgraded {path}")
@@ -317,34 +171,27 @@ def bump_file(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Upgrade dependencies in PEP 723 Python scripts."
+    )
 
     parser.add_argument(
         "files",
         nargs="*",
         type=Path,
+        help="Python scripts to inspect",
     )
 
     parser.add_argument(
         "--all",
         action="store_true",
-    )
-
-    parser.add_argument(
-        "--force-update",
-        action="store_true",
-        help=(
-            "Update versions while preserving "
-            "existing version operators."
-        ),
+        help="scan the repository recursively",
     )
 
     args = parser.parse_args()
 
     if args.all and args.files:
-        parser.error(
-            "--all cannot be combined with files"
-        )
+        parser.error("--all cannot be combined with files")
 
     if args.all:
         files = python_files(Path.cwd())
@@ -352,22 +199,10 @@ def main() -> int:
         files = args.files
 
     if not files:
-        parser.error(
-            "provide files or use --all"
-        )
-
-    if shutil.which("uv") is None:
-        print(
-            "error: uv executable not found",
-            file=sys.stderr,
-        )
-        return 2
+        parser.error("provide files or use --all")
 
     changed = any(
-        bump_file(
-            path,
-            args.force_update,
-        )
+        bump_file(path)
         for path in files
     )
 
