@@ -146,6 +146,7 @@ def bump_file(path: Path) -> bool:
             "uv",
             "add",
             "--script",
+            "--upgrade",
             str(path),
             *packages,
         ],
